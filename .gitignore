@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.log
+*.tmp
+.env
+.env.*
+ocr_temp/
+ocr_chapters/
+llm_cleanup/
+*.egg-info/
+.venv/
+venv/
