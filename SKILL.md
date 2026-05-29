@@ -142,6 +142,45 @@ Agent behavior:
 4. Never paste full OCR page text into the chat unless the user asks for a
    specific page.
 
+## Failed Page Retry Flow
+
+After the first OCR pass, `pipeline.py` reads `<work-dir>/ocr.log` and checks
+for pages whose latest status is `FAIL`.
+
+Default behavior:
+
+1. Retry failed pages once automatically.
+2. Choose retry settings from the logged error:
+   - GGML/tensor/dimension errors use smaller aligned images
+     (`--max-dim 800`, `--align 32`, `--num-ctx 8192`, `--workers 1`).
+   - Ollama health or connection errors retry serially with `--workers 1`.
+   - Other failures use a conservative smaller-image serial retry.
+3. If pages still fail and the count is small, report the exact page numbers and
+   ask whether to retry again when running interactively.
+4. If the user declines, or the shell is non-interactive, unload the OCR model
+   with `ollama stop <model>` and continue cleanup, formatting, and chapter
+   detection/merge with the successfully OCR'd pages.
+
+Useful controls:
+
+```bash
+--no-auto-ocr-retry
+--failed-ocr-threshold 10
+--failed-ocr-action ask
+--failed-ocr-action continue
+--failed-ocr-action retry
+--failed-ocr-action abort
+--keep-ollama-on-ocr-skip
+```
+
+Agent behavior:
+
+- Let the automatic one-pass retry run before deciding anything manually.
+- If the script reports remaining failed pages, relay those page numbers to the
+  user and ask only whether to keep trying OCR for those pages.
+- If the user says not to continue OCR, allow the pipeline to proceed; the script
+  will unload the Ollama model unless `--keep-ollama-on-ocr-skip` was set.
+
 ## Large-Model Cleanup And Formatting
 
 Local cleanup is fast and deterministic, but it may miss textbook structure. For
@@ -302,7 +341,9 @@ and ensure dimensions are aligned to 16-pixel boundaries.
 
 **Need to rerun only failed or missing pages**
 
-Run again without `--force-ocr`; existing valid `.txt` files will be skipped.
+The pipeline now reads `ocr.log` after the first pass and retries logged `FAIL`
+pages once automatically. For a manual rerun, run again without `--force-ocr`;
+existing valid `.txt` files will be skipped.
 
 **GGML_ASSERT model crash on certain pages**
 

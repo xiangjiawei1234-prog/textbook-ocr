@@ -4,7 +4,7 @@ Textbook OCR Pipeline — 课本扫描图片 → 清洁 Markdown 章节
 Usage: python pipeline.py --image-dir 图片/ --output-dir 输出/ [--chapters chapters.json]
 """
 
-import sys, io, re, os, time, json, base64, argparse
+import sys, io, re, os, time, json, base64, argparse, subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -31,7 +31,9 @@ OCR_NUM_CTX = int_env('TEXTBOOK_OCR_NUM_CTX', 0)
 JPEG_QUALITY = 90
 SLEEP_BETWEEN = 0.0
 MAX_RETRIES = 3
+MIN_VALID_CHARS = 20
 DEFAULT_WORKERS = max(1, int(os.environ.get('TEXTBOOK_OCR_WORKERS', '2')))
+DEFAULT_FAIL_PROMPT_THRESHOLD = int_env('TEXTBOOK_OCR_FAIL_PROMPT_THRESHOLD', 10)
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp'}
 
 # ============================================================
@@ -97,8 +99,187 @@ def append_log(log_file, message):
         f.write(message.rstrip() + '\n')
 
 
+def page_key(value):
+    stem = Path(str(value)).stem
+    return int(stem) if stem.isdigit() else stem.lower()
+
+
+def read_ocr_failures_from_log(log_file, start_offset=0):
+    """Read OCR log lines and return pages whose latest status is FAIL."""
+    log_file = Path(log_file)
+    if not log_file.exists():
+        return {}
+
+    status_re = re.compile(
+        r'^\[\d+/\d+\]\s+(.+?\.(?:jpg|jpeg|png|webp))\s+(OK|SKIP|FAIL)\b\s*(.*)$',
+        re.I,
+    )
+    failures = {}
+    with log_file.open('rb') as f:
+        if start_offset:
+            f.seek(start_offset)
+        text = f.read().decode('utf-8', errors='replace')
+        for line in text.splitlines():
+            m = status_re.match(line.strip())
+            if not m:
+                continue
+            filename, status, detail = m.group(1), m.group(2).upper(), m.group(3).strip()
+            key = page_key(filename)
+            if status == 'FAIL':
+                failures[key] = {'filename': filename, 'error': detail or 'unknown error'}
+            else:
+                failures.pop(key, None)
+    return failures
+
+
+def retry_settings_for_errors(failures):
+    """Choose a conservative retry strategy from logged error messages."""
+    error_text = ' '.join(item['error'] for item in failures.values()).lower()
+    settings = {
+        'workers': 1,
+        'max_dim': MAX_DIM,
+        'align': IMAGE_ALIGN,
+        'num_ctx': OCR_NUM_CTX,
+        'reason': 'single-worker retry after OCR failures',
+    }
+
+    dimension_markers = (
+        'ggml_assert', 'ne[2]', 'dimension', 'tensor', 'shape', 'clip',
+    )
+    health_markers = (
+        'health resp', 'dial tcp', 'connection refused', 'connectex',
+        'server error', 'runner process',
+    )
+
+    if any(marker in error_text for marker in dimension_markers):
+        settings.update({
+            'max_dim': 800,
+            'align': 32,
+            'num_ctx': max(OCR_NUM_CTX, 8192),
+            'reason': 'dimension/assert failure; retrying with smaller aligned images',
+        })
+    elif any(marker in error_text for marker in health_markers):
+        settings.update({
+            'reason': 'Ollama health/connection failure; retrying serially',
+        })
+    else:
+        settings.update({
+            'max_dim': min(MAX_DIM, 1000),
+            'align': max(IMAGE_ALIGN, 32),
+            'num_ctx': max(OCR_NUM_CTX, 8192),
+            'reason': 'generic OCR failure; retrying with safer image settings',
+        })
+
+    return settings
+
+
+def retry_failed_pages_once(image_dir, output_dir, failures, quiet=True,
+                            progress_every=10, log_file=None, progress_file=None):
+    """Retry only failed pages once using settings chosen from the OCR log."""
+    global MAX_DIM, IMAGE_ALIGN, OCR_NUM_CTX
+
+    if not failures:
+        return {}
+
+    settings = retry_settings_for_errors(failures)
+    old_settings = (MAX_DIM, IMAGE_ALIGN, OCR_NUM_CTX)
+    MAX_DIM = settings['max_dim']
+    IMAGE_ALIGN = settings['align']
+    OCR_NUM_CTX = settings['num_ctx']
+
+    pages = sorted(failures)
+    page_list = ', '.join(f"{p:03d}" if isinstance(p, int) else str(p) for p in pages)
+    print(
+        f"[OCR] Retrying failed pages once ({len(pages)}): {page_list}; "
+        f"{settings['reason']}; max_dim={MAX_DIM}, align={IMAGE_ALIGN}, "
+        f"num_ctx={OCR_NUM_CTX}, workers={settings['workers']}"
+    )
+    append_log(
+        log_file,
+        f"[OCR] retry start pages={page_list} reason={settings['reason']} "
+        f"max_dim={MAX_DIM} align={IMAGE_ALIGN} num_ctx={OCR_NUM_CTX} "
+        f"workers={settings['workers']}",
+    )
+
+    try:
+        return batch_ocr(
+            image_dir,
+            output_dir,
+            force=True,
+            workers=settings['workers'],
+            quiet=quiet,
+            progress_every=progress_every,
+            log_file=log_file,
+            progress_file=progress_file,
+            target_pages=pages,
+            phase='ocr-retry',
+        )
+    finally:
+        MAX_DIM, IMAGE_ALIGN, OCR_NUM_CTX = old_settings
+
+
+def stop_ollama_model(log_file=None):
+    """Unload the OCR model so Ollama releases GPU memory before later stages."""
+    cmd = ['ollama', 'stop', OCR_MODEL]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except FileNotFoundError:
+        message = "[Ollama] Cannot stop model: ollama command was not found"
+    except Exception as e:
+        message = f"[Ollama] Cannot stop model: {e}"
+    else:
+        if result.returncode == 0:
+            message = f"[Ollama] Stopped model {OCR_MODEL}"
+        else:
+            detail = (result.stderr or result.stdout or '').strip()
+            message = f"[Ollama] Could not stop model {OCR_MODEL}: {detail}"
+    print(message)
+    append_log(log_file, message)
+
+
+def print_failed_page_report(failures, max_pages=None):
+    pages = sorted(failures)
+    print(f"[OCR] Remaining failed pages after retry: {len(pages)}")
+    shown = pages if max_pages is None or len(pages) <= max_pages else pages[:max_pages]
+    for key in shown:
+        item = failures[key]
+        page = f"{key:03d}" if isinstance(key, int) else str(key)
+        print(f"  page {page} ({item['filename']}): {item['error']}")
+    omitted = len(pages) - len(shown)
+    if omitted > 0:
+        print(f"  ... {omitted} more failed pages omitted from console report")
+
+
+def should_retry_after_report(failures, threshold, action):
+    """Return True when the user/action asks for one more targeted retry."""
+    if not failures:
+        return False
+
+    if action == 'retry':
+        return True
+    if action == 'abort':
+        raise SystemExit(2)
+    if action == 'continue':
+        return False
+
+    if len(failures) > threshold:
+        print(
+            f"[OCR] Remaining failures exceed prompt threshold "
+            f"({len(failures)} > {threshold}); continuing without more OCR."
+        )
+        return False
+
+    if not sys.stdin.isatty():
+        print("[OCR] Non-interactive shell; continuing without more OCR.")
+        return False
+
+    answer = input("Retry these failed pages one more time? [y/N] ").strip().lower()
+    return answer in {'y', 'yes'}
+
+
 def batch_ocr(image_dir, output_dir, force=False, workers=DEFAULT_WORKERS,
-              quiet=True, progress_every=10, log_file=None, progress_file=None):
+              quiet=True, progress_every=10, log_file=None, progress_file=None,
+              target_pages=None, phase='ocr'):
     """Run OCR on numbered .jpg files, save one .txt per page.
 
     Quiet mode keeps stdout small so agents do not stream every page into context.
@@ -114,10 +295,13 @@ def batch_ocr(image_dir, output_dir, force=False, workers=DEFAULT_WORKERS,
          if f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS and f.stem.isdigit()],
         key=lambda x: int(x.stem)
     )
+    if target_pages:
+        target_keys = {page_key(p) for p in target_pages}
+        images = [f for f in images if page_key(f.name) in target_keys]
     total = len(images)
     print(f"[OCR] Found {total} images; workers={workers}")
     if log_file:
-        append_log(log_file, f"[OCR] start total={total} workers={workers}")
+        append_log(log_file, f"[OCR] start phase={phase} total={total} workers={workers}")
 
     queued = []
     skipped = 0
@@ -129,7 +313,7 @@ def batch_ocr(image_dir, output_dir, force=False, workers=DEFAULT_WORKERS,
 
         if out_file.exists() and not force:
             existing = out_file.read_text(encoding='utf-8').strip()
-            if len(existing) > 20:
+            if len(existing) > MIN_VALID_CHARS:
                 skipped += 1
                 done += 1
                 append_log(log_file, f"[{i}/{total}] {img_path.name} SKIP {len(existing)} chars")
@@ -140,7 +324,7 @@ def batch_ocr(image_dir, output_dir, force=False, workers=DEFAULT_WORKERS,
         if not progress_file:
             return
         write_json(progress_file, {
-            'stage': 'ocr',
+            'stage': phase,
             'total': total,
             'done': done,
             'queued': len(queued),
@@ -156,14 +340,20 @@ def batch_ocr(image_dir, output_dir, force=False, workers=DEFAULT_WORKERS,
     if not queued:
         print(f"[OCR] Done; skipped={skipped}, failed=0")
         if log_file:
-            append_log(log_file, f"[OCR] done skipped={skipped} failed=0")
-        return
+            append_log(log_file, f"[OCR] done phase={phase} skipped={skipped} failed=0")
+        return {
+            'total': total,
+            'skipped': skipped,
+            'failed': 0,
+            'failed_pages': {},
+        }
 
     def run_one(item):
         i, img_path, out_file = item
         text = ocr_image(img_path)
         return i, img_path, out_file, text
 
+    failed_pages = {}
     with ThreadPoolExecutor(max_workers=workers) as executor:
         future_map = {executor.submit(run_one, item): item for item in queued}
         for future in as_completed(future_map):
@@ -174,6 +364,10 @@ def batch_ocr(image_dir, output_dir, force=False, workers=DEFAULT_WORKERS,
                 status = f"[{i}/{total}] {img_path.name} OK {len(text)} chars"
             except Exception as e:
                 failed += 1
+                failed_pages[page_key(img_path.name)] = {
+                    'filename': img_path.name,
+                    'error': str(e) or type(e).__name__,
+                }
                 status = f"[{i}/{total}] {img_path.name} FAIL {e}"
 
             done += 1
@@ -186,7 +380,13 @@ def batch_ocr(image_dir, output_dir, force=False, workers=DEFAULT_WORKERS,
 
     print(f"[OCR] Done; pages={total}, skipped={skipped}, failed={failed}")
     if log_file:
-        append_log(log_file, f"[OCR] done total={total} skipped={skipped} failed={failed}")
+        append_log(log_file, f"[OCR] done phase={phase} total={total} skipped={skipped} failed={failed}")
+    return {
+        'total': total,
+        'skipped': skipped,
+        'failed': failed,
+        'failed_pages': failed_pages,
+    }
 
 
 # ============================================================
@@ -708,6 +908,16 @@ def main():
                         help='Detailed OCR log file. Default: <work-dir>/ocr.log')
     parser.add_argument('--progress-file',
                         help='Machine-readable OCR status JSON. Default: <work-dir>/ocr_progress.json')
+    parser.add_argument('--no-auto-ocr-retry', action='store_true',
+                        help='Disable the automatic one-pass retry for pages that failed in ocr.log')
+    parser.add_argument('--failed-ocr-threshold', type=int, default=DEFAULT_FAIL_PROMPT_THRESHOLD,
+                        help='Ask about remaining OCR failures only when count is at or below this number')
+    parser.add_argument('--failed-ocr-action',
+                        choices=('ask', 'continue', 'retry', 'abort'),
+                        default=os.environ.get('TEXTBOOK_OCR_FAILED_ACTION', 'ask'),
+                        help='What to do when pages still fail after the automatic retry')
+    parser.add_argument('--keep-ollama-on-ocr-skip', action='store_true',
+                        help='Do not unload the Ollama OCR model when unresolved failed pages are skipped')
     parser.add_argument('--prepare-llm-cleanup', action='store_true',
                         help='After OCR, write bounded chunks for large-model cleanup and stop')
     parser.add_argument('--apply-llm-cleanup',
@@ -724,6 +934,8 @@ def main():
                         help='Run local clean/format even after applying LLM-cleaned chunks')
 
     args = parser.parse_args()
+    if args.failed_ocr_action not in {'ask', 'continue', 'retry', 'abort'}:
+        parser.error('--failed-ocr-action must be one of: ask, continue, retry, abort')
 
     OCR_MODEL = args.model
     OCR_PROMPT = args.prompt
@@ -750,6 +962,7 @@ def main():
     if not args.skip_ocr:
         if not args.image_dir:
             parser.error('--image-dir is required unless --skip-ocr or --detect-only is used')
+        log_start_offset = log_file.stat().st_size if log_file.exists() else 0
         batch_ocr(
             args.image_dir,
             work_dir,
@@ -760,6 +973,45 @@ def main():
             log_file=log_file,
             progress_file=progress_file,
         )
+        failures = read_ocr_failures_from_log(log_file, log_start_offset)
+        if failures and not args.no_auto_ocr_retry:
+            retry_start_offset = log_file.stat().st_size if log_file.exists() else 0
+            retry_failed_pages_once(
+                args.image_dir,
+                work_dir,
+                failures,
+                quiet=not args.verbose,
+                progress_every=args.progress_every,
+                log_file=log_file,
+                progress_file=progress_file,
+            )
+            failures = read_ocr_failures_from_log(log_file, retry_start_offset)
+
+        if failures:
+            failed_threshold = max(0, int(args.failed_ocr_threshold))
+            print_failed_page_report(failures, max_pages=failed_threshold)
+            if should_retry_after_report(
+                failures,
+                failed_threshold,
+                args.failed_ocr_action,
+            ):
+                retry_start_offset = log_file.stat().st_size if log_file.exists() else 0
+                retry_failed_pages_once(
+                    args.image_dir,
+                    work_dir,
+                    failures,
+                    quiet=not args.verbose,
+                    progress_every=args.progress_every,
+                    log_file=log_file,
+                    progress_file=progress_file,
+                )
+                failures = read_ocr_failures_from_log(log_file, retry_start_offset)
+                if failures:
+                    print_failed_page_report(failures, max_pages=failed_threshold)
+                    if not args.keep_ollama_on_ocr_skip:
+                        stop_ollama_model(log_file)
+            elif not args.keep_ollama_on_ocr_skip:
+                stop_ollama_model(log_file)
 
     if args.prepare_llm_cleanup:
         prepare_llm_cleanup(work_dir, llm_dir, max_chars=args.llm_chunk_chars)
